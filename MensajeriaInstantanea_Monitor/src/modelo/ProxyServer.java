@@ -14,6 +14,7 @@ public class ProxyServer {
     private final List<ServerInfo> servers;
     private final ScheduledExecutorService heartbeat;
     private final List<String> journal = Collections.synchronizedList(new ArrayList<>());
+    //el journal solo tiene la lista de usuarios y la lista de mansajes almacenados, se pide cuando se reconecta un server
 
     public ProxyServer(int proxyPort, List<ServerInfo> servers) {
         this.proxyPort = proxyPort;
@@ -75,6 +76,7 @@ public class ProxyServer {
                 if (request == null) return;
 
                 // Guardar en journal para resincronización futura
+                //esto no va, el journal debe tener solo la info que me envia el servidor cuando se la pido
                 journal.add(request);
 
                 // Fan-out a servidores activos con reintentos
@@ -104,6 +106,9 @@ public class ProxyServer {
             return "ERROR: No hay servidores disponibles";
         }
     }
+    
+    // metodo para pedir la info a un server activo
+    
 
     // Información de cada réplica
     public static class ServerInfo {
