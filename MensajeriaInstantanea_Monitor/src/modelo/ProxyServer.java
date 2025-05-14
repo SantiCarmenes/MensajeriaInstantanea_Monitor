@@ -5,141 +5,107 @@ import java.net.*;
 import java.util.*;
 import java.util.concurrent.*;
 
-/**
- * ProxyServer actúa como monitor y equilibrador de carga entre réplicas de Servidor.
- * Implementa redundancia activa, heartbeat, retry con ACK y journal para resincronización.
- */
 public class ProxyServer {
-    private final int proxyPort;
-    private final int registrationPort;
-    private final List<ServerInfo> servers = Collections.synchronizedList(new ArrayList<>());
-    private volatile int primaryIndex = 0;
-    private final ScheduledExecutorService hbExec;
-    private final Journal journal;
+    private static final int PORT = 60000;
+    private final List<ServerConnection> servers = new CopyOnWriteArrayList<>();
+    private int nextIndex = -1;
 
-    public ProxyServer(int proxyPort, int registrationPort) { //atiende clientes en 65000 y registros en 65001
-        this.proxyPort = proxyPort;
-        this.registrationPort = registrationPort;
-        this.hbExec = Executors.newSingleThreadScheduledExecutor();
-        this.journal = new Journal();
+    public static void main(String[] args) throws IOException {
+        new ProxyServer().start();
     }
 
     public void start() throws IOException {
-        // Inicia heartbeat periódico
-        hbExec.scheduleAtFixedRate(this::heartbeat, 0, 5, TimeUnit.SECONDS);
-
-        // Arranca hilo de registro de servidores
-        new Thread(this::handleRegistrations).start();
-
-        // Escucha conexiones de clientes
-        try (ServerSocket ss = new ServerSocket(proxyPort)) {
-            System.out.println("Proxy escuchando en puerto cliente " + proxyPort);
+        try (ServerSocket listener = new ServerSocket(PORT)) {
+            System.out.println("Proxy listening on port " + PORT);
             while (true) {
-                Socket client = ss.accept();
-                new ProxyHandler(client).start();
+                Socket sock = listener.accept();
+                new Thread(() -> handleConnection(sock)).start();
             }
         }
     }
 
-    /** Atención de peticiones de registro de servidores */
-    private void handleRegistrations() {
-        try (ServerSocket regSock = new ServerSocket(registrationPort)) {
-            System.out.println("Proxy escuchando registros en puerto " + registrationPort);
-            while (true) {
-                Socket sock = regSock.accept();
-                BufferedReader in = new BufferedReader(new InputStreamReader(sock.getInputStream()));
-                String line = in.readLine(); // espera "REGISTER ip:port"
-                if (line != null && line.startsWith("REGISTER ")) {
-                    String[] parts = line.substring(9).split(":");
-                    String ip = parts[0];
-                    int port = Integer.parseInt(parts[1]);
-                    ServerInfo srv = new ServerInfo(ip, port);
-                    servers.add(srv);
-                    System.out.println("Servidor registrado: " + srv);
-                }
-                sock.close();
+    private void handleConnection(Socket sock) {
+        try (BufferedReader in = new BufferedReader(new InputStreamReader(sock.getInputStream()));
+             PrintWriter out = new PrintWriter(sock.getOutputStream(), true)) {
+
+            String header = in.readLine();
+            if (header == null) return;
+            String op = parseField(header, "OPERACION");
+
+            switch (op) {
+                case "REGISTER":
+                    registerServer(header, in, out);
+                    break;
+                case "RECONNECT_USER":
+                    reconnectUser(header, in, out);
+                    break;
+                default:
+                    forwardClient(header, in, out);
             }
         } catch (IOException e) {
             e.printStackTrace();
         }
     }
 
-    /** Verifica salud de réplicas y resincroniza nuevas */
-    private void heartbeat() {
-        synchronized (servers) {
-            for (int i = 0; i < servers.size(); i++) {
-                ServerInfo srv = servers.get(i);
-                boolean alive = srv.ping();
-                if (!alive && primaryIndex == i) {
-                    primaryIndex = (i + 1) % servers.size();
-                    System.out.println("Failover a " + servers.get(primaryIndex));
-                }
-                if (alive && i != primaryIndex && !srv.handshaken) {
-                    JournalReplayer.replay(journal, servers.get(primaryIndex), srv);
-                    srv.handshaken = true;
-                    System.out.println("Journal sync a " + srv);
-                }
-            }
-        }
+    private void registerServer(String header, BufferedReader in, PrintWriter out) throws IOException {
+        String ip = parseField(header, "IP");
+        int port = Integer.parseInt(parseField(header, "PUERTO"));
+        ServerConnection sc = new ServerConnection(ip, port);
+        servers.add(sc);
+        out.println("RESPUESTA:ACK");
+        // synchronize state if needed
     }
 
-    /** Envía con retry+ACK y failover; devuelve respuesta al cliente */
+    private void reconnectUser(String header, BufferedReader in, PrintWriter out) throws IOException {
+        String user = parseField(header, "USER");
+        // retrieve pending messages from proxy journal
+        String pending = getPendingFor(user);
+        out.println("RESPUESTA:" + pending);
+        // propagate cleanup to servers
+    }
+
+    private void forwardClient(String header, BufferedReader in, PrintWriter out) throws IOException {
+        String body = in.readLine();
+        String fullReq = header + "\n" + body;
+        String resp = forwardWithRetry(fullReq);
+        if (resp != null) out.println(resp);
+        else out.println("ERROR;NO_BACKEND");
+    }
+
     private String forwardWithRetry(String req) {
-        journal.append(req);
-        int start = primaryIndex;
-        for (int offset = 0; offset < servers.size(); offset++) {
-            int idx = (start + offset) % servers.size();
-            ServerInfo srv = servers.get(idx);
-            if (!srv.isAlive()) continue;
-            for (int attempt = 1; attempt <= 3; attempt++) {
-                try (Socket sock = new Socket()) {
-                    sock.connect(new InetSocketAddress(srv.ip, srv.port), 2000);
-                    sock.setSoTimeout(2000);
-                    PrintWriter out = new PrintWriter(sock.getOutputStream(), true);
-                    BufferedReader in = new BufferedReader(new InputStreamReader(sock.getInputStream()));
-                    out.println(req);
-                    String ack = in.readLine();
-                    if ("OK".equals(ack)) {
-                        out.println("GIVE_RESPONSE");
-                        return in.readLine();
-                    }
-                } catch (IOException e) {
-                    // retry
-                }
-            }
-            // marcar muerto y cambiar primary
-            srv.setAlive(false);
-            primaryIndex = (idx + 1) % servers.size();
-            System.err.println("Servidor " + srv + " no responde; conmutando.");
-        }
-        return "ERROR: ningún servidor disponible";
-    }
-
-    /** Handler que atiende a cada cliente */
-    private class ProxyHandler extends Thread {
-        private final Socket client;
-        ProxyHandler(Socket client) { this.client = client; }
-        @Override
-        public void run() {
-            try (
-                BufferedReader inCl = new BufferedReader(new InputStreamReader(client.getInputStream()));
-                PrintWriter outCl = new PrintWriter(client.getOutputStream(), true)
-            ) {
-                String req = inCl.readLine();
-                if (req == null) return;
-                String resp = forwardWithRetry(req);
-                outCl.println(resp);
+        for (int i = 0; i < 3; i++) {
+            ServerConnection sc = pickNextAlive();
+            if (sc == null) break;
+            try {
+                String r = sc.sendAndReceive(req);
+                if ("ACK".equalsIgnoreCase(parseField(r, "RESPUESTA"))) return r;
             } catch (IOException e) {
-                e.printStackTrace();
-            } finally {
-                try { 
-                	client.close(); 
-                } catch (IOException ignored) {}
+                sc.markDead();
             }
         }
+        return null;
     }
 
-    public static void main(String[] args) throws Exception {
-        new ProxyServer(65000, 65001).start();
+    private ServerConnection pickNextAlive() {
+        int n = servers.size();
+        for (int i = 0; i < n; i++) {
+            nextIndex = (nextIndex + 1) % n;
+            ServerConnection sc = servers.get(nextIndex);
+            if (sc.isAlive()) return sc;
+        }
+        return null;
+    }
+
+    private String parseField(String line, String key) {
+        String[] parts = line.split(";");
+        for (String p: parts) {
+            if (p.startsWith(key + ":")) return p.substring((key + ":").length());
+        }
+        return "";
+    }
+
+    private String getPendingFor(String user) {
+        // TODO: look up journal map
+        return "";
     }
 }
