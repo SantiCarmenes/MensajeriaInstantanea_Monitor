@@ -4,108 +4,143 @@ import java.io.*;
 import java.net.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
+/**
+ * ProxyServer: escucha en un único puerto (60000),
+ * acepta conexiones de clientes y servidores,
+ * enruta peticiones a un backend vivo usando round‑robin,
+ * reintenta hasta 3 veces con ACK antes de cambiar de servidor,
+ * y mantiene un heartbeat periódico para detectar réplicas caídas/recuperadas.
+ */
 public class ProxyServer {
-    private static final int PORT = 60000;
-    private final List<ServerConnection> servers = new CopyOnWriteArrayList<>();
-    private int nextIndex = -1;
+    public static final int PROXY_PORT = 60000;
+    private final ServerSocket listenSocket;
+    private final List<ServerConnection> backends = new CopyOnWriteArrayList<>();
+    private final AtomicInteger rrCounter = new AtomicInteger(0);
+    private final ScheduledExecutorService heartbeatExec = Executors.newSingleThreadScheduledExecutor();
+
+    public ProxyServer() throws IOException {
+        this.listenSocket = new ServerSocket(PROXY_PORT);
+        // Arrancamos heartbeat: cada 5s ping a todos los backends registrados
+        heartbeatExec.scheduleAtFixedRate(this::runHeartbeat, 5, 5, TimeUnit.SECONDS);
+    }
 
     public static void main(String[] args) throws IOException {
-        new ProxyServer().start();
+        System.out.println("[PROXY] Arrancando proxy en puerto " + PROXY_PORT);
+        new ProxyServer().acceptLoop();
     }
 
-    public void start() throws IOException {
-        try (ServerSocket listener = new ServerSocket(PORT)) {
-            System.out.println("Proxy listening on port " + PORT);
-            while (true) {
-                Socket sock = listener.accept();
+    /** Bucle principal: acepta conexiones entrantes (clientes y servidores). */
+    private void acceptLoop() {
+        while (true) {
+            try {
+                Socket sock = listenSocket.accept();
+                // Cada conexión la manejamos en un hilo aparte
                 new Thread(() -> handleConnection(sock)).start();
+            } catch (IOException e) {
+                e.printStackTrace();
             }
         }
     }
 
+    /** Lee la primera línea para decidir la operación y despacha. */
     private void handleConnection(Socket sock) {
-        try (BufferedReader in = new BufferedReader(new InputStreamReader(sock.getInputStream()));
-             PrintWriter out = new PrintWriter(sock.getOutputStream(), true)) {
-
+        try (
+            BufferedReader in  = new BufferedReader(new InputStreamReader(sock.getInputStream()));
+            PrintWriter    out = new PrintWriter(sock.getOutputStream(), true)
+        ) {
             String header = in.readLine();
             if (header == null) return;
+
             String op = parseField(header, "OPERACION");
-
             switch (op) {
-                case "REGISTER":
-                    registerServer(header, in, out);
-                    break;
-                case "RECONNECT_USER":
-                    reconnectUser(header, in, out);
-                    break;
+                case "REGISTER":      registerBackend(header, out);       break;
+                case "CLIENT_REQ":    forwardClient(header, in, out);     break;
                 default:
-                    forwardClient(header, in, out);
+                    out.println("ERROR;MSG:Operacion desconocida");
             }
-        } catch (IOException e) {
-            e.printStackTrace();
+        } catch (IOException ioe) {
+            ioe.printStackTrace();
+        } finally {
+            try { sock.close(); } catch (IOException ignored) {}
         }
     }
 
-    private void registerServer(String header, BufferedReader in, PrintWriter out) throws IOException {
-        String ip = parseField(header, "IP");
-        int port = Integer.parseInt(parseField(header, "PUERTO"));
+    //––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+
+    /**  
+     * REGISTRO DE UN BACKEND.  
+     * HEADER ejemplo: "OPERACION:REGISTER;IP:1.2.3.4;PUERTO:12345"
+     */
+    private void registerBackend(String header, PrintWriter out) {
+        String ip   = parseField(header, "IP");
+        int    port = Integer.parseInt(parseField(header, "PUERTO"));
         ServerConnection sc = new ServerConnection(ip, port);
-        servers.add(sc);
+        backends.add(sc);
         out.println("RESPUESTA:ACK");
-        // synchronize state if needed
+        System.out.println("[PROXY] Backend registrado: " + ip + ":" + port);
     }
 
-    private void reconnectUser(String header, BufferedReader in, PrintWriter out) throws IOException {
-        String user = parseField(header, "USER");
-        // retrieve pending messages from proxy journal
-        String pending = getPendingFor(user);
-        out.println("RESPUESTA:" + pending);
-        // propagate cleanup to servers
-    }
-
+    /**
+     * Reenvía la petición de cliente al backend vivo seleccionado.
+     * Retries + espera de ACK.  
+     * HEADER ejemplo: "OPERACION:CLIENT_REQ;USER:Foo"
+     * BODY: la línea siguiente (por ejemplo, JSON u otro formato).
+     */
     private void forwardClient(String header, BufferedReader in, PrintWriter out) throws IOException {
-        String body = in.readLine();
-        String fullReq = header + "\n" + body;
-        String resp = forwardWithRetry(fullReq);
-        if (resp != null) out.println(resp);
-        else out.println("ERROR;NO_BACKEND");
+        String body  = in.readLine();
+        String full  = header + "\n" + (body == null ? "" : body);
+        String reply = forwardWithRetry(full);
+        out.println(reply);
     }
 
+    /**
+     * Round‑Robin + retry hasta 3 veces esperando un ACK en formato "ACK".
+     * Si no llega, marca el backend muerto y continúa con el siguiente.
+     */
     private String forwardWithRetry(String req) {
-        for (int i = 0; i < 3; i++) {
-            ServerConnection sc = pickNextAlive();
-            if (sc == null) break;
+        int backendCount = backends.size();
+        if (backendCount == 0) return "ERROR;MSG:No hay backends disponibles";
+
+        // Intentamos como máximo `backends.size()` distintos servidores
+        for (int i = 0; i < backendCount; i++) {
+            int idx = rrCounter.getAndIncrement() % backendCount;
+            ServerConnection sc = backends.get(idx);
+            if (!sc.isAlive()) continue;
+
             try {
-                String r = sc.sendAndReceive(req);
-                if ("ACK".equalsIgnoreCase(parseField(r, "RESPUESTA"))) return r;
+                // sendAndAwaitAck reintenta internamente 3 veces
+                String resp = sc.sendAndAwaitAck(req);
+                return resp;
             } catch (IOException e) {
+                System.err.println("[PROXY] Falló backend " + sc + ", lo marcamos muerto.");
                 sc.markDead();
+                // seguimos al siguiente
             }
         }
-        return null;
+        return "ERROR;MSG:Todos los backends caidos";
     }
 
-    private ServerConnection pickNextAlive() {
-        int n = servers.size();
-        for (int i = 0; i < n; i++) {
-            nextIndex = (nextIndex + 1) % n;
-            ServerConnection sc = servers.get(nextIndex);
-            if (sc.isAlive()) return sc;
+    /** Cada 5s hacemos ping a todos los backends para mantener vivos/muertos */
+    private void runHeartbeat() {
+        for (ServerConnection sc : backends) {
+            if (!sc.checkHeartbeat()) {
+                System.err.println("[PROXY] Backend no responde: " + sc);
+                sc.markDead();
+            } else {
+                sc.markAlive();
+            }
         }
-        return null;
     }
 
-    private String parseField(String line, String key) {
-        String[] parts = line.split(";");
-        for (String p: parts) {
-            if (p.startsWith(key + ":")) return p.substring((key + ":").length());
+    /** Extrae valor tras "clave:valor" en un header separado por ';' */
+    private String parseField(String header, String key) {
+        for (String part : header.split(";")) {
+            if (part.startsWith(key + ":")) {
+                return part.substring(key.length()+1).trim();
+            }
         }
-        return "";
-    }
-
-    private String getPendingFor(String user) {
-        // TODO: look up journal map
         return "";
     }
 }
