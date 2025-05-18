@@ -65,12 +65,13 @@ public class ServerConnection {
 
                 // 2) Esperar ACK
                 String line = in.readLine();
+                System.out.println(line);
                 if (!"ACK".equalsIgnoreCase(line)) {
                     throw new IOException("No vino ACK (vino: " + line + ")");
                 }
-
                 // 3) Leer respuesta real
                 String resp = in.readLine();
+                System.out.println("respuesta " + resp);
                 return resp != null ? resp : "";
 
             } catch (IOException ioe) {

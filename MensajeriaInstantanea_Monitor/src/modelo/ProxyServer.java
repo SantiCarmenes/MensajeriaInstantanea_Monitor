@@ -19,6 +19,7 @@ public class ProxyServer {
     private final List<ServerConnection> backends = new CopyOnWriteArrayList<>();
     private final AtomicInteger rrCounter = new AtomicInteger(0);
     private final ScheduledExecutorService heartbeatExec = Executors.newSingleThreadScheduledExecutor();
+    private final HashMap<String,Socket> connectedUsersMap = new HashMap<String, Socket>();
 
     public ProxyServer() throws IOException {
         this.listenSocket = new ServerSocket(PROXY_PORT);
@@ -50,20 +51,46 @@ public class ProxyServer {
             BufferedReader in  = new BufferedReader(new InputStreamReader(sock.getInputStream()));
             PrintWriter    out = new PrintWriter(sock.getOutputStream(), true)
         ) {
-            String header = in.readLine();
-            if (header == null) return;
-
-            String op = parseField(header, "OPERACION");
-            switch (op) {
-                case "REGISTER":      registerBackend(header, out);       break;
-                case "CLIENT_REQ":    forwardClient(header, in, out);     break;
-                default:
-                    out.println("ERROR;MSG:Operacion desconocida");
-            }
+        	while(true) {        		
+        		String header = in.readLine();
+        		//if (header == null) return;
+        		
+        		String op = parseField(header, "OPERACION");
+        		System.out.println(header);
+        		String address;
+        		System.out.println("[PROXY] Conectado desde "+sock.getInetAddress() + ":" + sock.getPort());
+        		switch (op) {
+        		case "REGISTER":
+        			registerBackend(header, out);
+        			sock.close();
+        			break;
+        		case "CLIENT_REQ":
+        			forwardClient(header.concat(";ADDRESS:"+sock.getInetAddress()+sock.getPort()), in, out);
+        			address = parseField(header,"ADDRESS");
+        			if(address.equals("")) {
+        				address = sock.getInetAddress()+""+sock.getPort();
+        				this.connectedUsersMap.putIfAbsent(address, sock);
+        				System.out.println("Conexion registrada");
+        			}
+        			break;
+        		case "MESSAGE":
+        			forwardClient(header, in, out);
+        			break;
+        		case "SEND_MESSAGE":
+        			sendServerMessage(header,in,out);
+        			break;
+        		default:
+        			out.println("ERROR;MSG:Operacion desconocida");
+        		}
+        	}
         } catch (IOException ioe) {
-            ioe.printStackTrace();
-        } finally {
-            try { sock.close(); } catch (IOException ignored) {}
+        	String address = sock.getInetAddress()+ "" +sock.getPort();
+        	if(this.connectedUsersMap.get(address) != null) {
+        		this.notifyClientDisconnected(address);
+        		System.out.println("eliminando usuario desconectado");
+        		this.connectedUsersMap.remove(address);
+        	}
+        	System.out.println("[PROXY] Desconectado: " + sock.getInetAddress()+":"+sock.getPort());
         }
     }
 
@@ -92,6 +119,10 @@ public class ProxyServer {
         String body  = in.readLine();
         String full  = header + "\n" + (body == null ? "" : body);
         String reply = forwardWithRetry(full);
+        
+        out.println("ACK");
+        System.out.println(reply);
+        out.println("OPERACION:CLIENT_REQ");
         out.println(reply);
     }
 
@@ -112,6 +143,7 @@ public class ProxyServer {
             try {
                 // sendAndAwaitAck reintenta internamente 3 veces
                 String resp = sc.sendAndAwaitAck(req);
+                
                 return resp;
             } catch (IOException e) {
                 System.err.println("[PROXY] Falló backend " + sc + ", lo marcamos muerto.");
@@ -132,6 +164,34 @@ public class ProxyServer {
                 sc.markAlive();
             }
         }
+    }
+    
+    private void notifyClientDisconnected(String address) {
+    	String header = "OPERACION:DISCONNECT;ADDRESS:" + address;
+    	String full  = header + "\n";
+    	
+    	String reply = this.forwardWithRetry(full);
+    	
+    	System.out.println("Respuesta servidor" + reply);
+    	
+    }
+    
+    private void sendServerMessage(String header,BufferedReader in,PrintWriter out) throws IOException{
+    	String body  = in.readLine();
+    	String address = parseField(header,"ADDRESS");
+    	String response;
+    	Socket socket = connectedUsersMap.get(address);
+    	BufferedReader inClient;
+    	PrintWriter outClient;
+    	if(socket != null) {
+    		inClient = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+    		outClient = new PrintWriter(socket.getOutputStream(), true);
+    		outClient.println("OPERACION:GET_MESSAGE");
+    		outClient.println(body);
+    		out.println("ACK");
+    	}else{
+    		out.println("OPERACION:RESEND_ERROR");
+    	}
     }
 
     /** Extrae valor tras "clave:valor" en un header separado por ';' */
