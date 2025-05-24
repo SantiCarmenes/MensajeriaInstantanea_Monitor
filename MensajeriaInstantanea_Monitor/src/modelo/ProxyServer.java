@@ -51,14 +51,14 @@ public class ProxyServer {
             BufferedReader in  = new BufferedReader(new InputStreamReader(sock.getInputStream()));
             PrintWriter    out = new PrintWriter(sock.getOutputStream(), true)
         ) {
-        	while(true) {        		
-        		String header = in.readLine();
+        	String header;
+        	while((header = in.readLine()) != null) {        		
         		//if (header == null) return;
         		
+        		System.out.println("[PROXY] Conectado desde "+sock.getInetAddress() + ":" + sock.getPort());
         		String op = parseField(header, "OPERACION");
         		System.out.println(header);
         		String address;
-        		System.out.println("[PROXY] Conectado desde "+sock.getInetAddress() + ":" + sock.getPort());
         		switch (op) {
         		case "REGISTER":
         			registerBackend(header, out);
@@ -120,9 +120,8 @@ public class ProxyServer {
         String full  = header + "\n" + (body == null ? "" : body);
         String reply = forwardWithRetry(full);
         
-        out.println("ACK");
         System.out.println(reply);
-        out.println("OPERACION:CLIENT_REQ");
+        out.println("OPERACION:RESPUESTA");
         out.println(reply);
     }
 
