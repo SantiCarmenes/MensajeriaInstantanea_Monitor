@@ -145,8 +145,8 @@ public class ProxyServer {
 
         // Intentamos como máximo `backends.size()` distintos servidores
         for (int i = 0; i < backendCount; i++) {
-            int idx = rrCounter.getAndIncrement() % backendCount;
-            ServerConnection sc = backends.get(idx);
+            //int idx = rrCounter.getAndIncrement() % backendCount;
+            ServerConnection sc = backends.get(i);
             if (!sc.isAlive()) continue;
 
             try {
