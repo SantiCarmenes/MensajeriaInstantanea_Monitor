@@ -1,10 +1,20 @@
 package modelo;
 
-import java.io.*;
-import java.net.*;
-import java.util.*;
-import java.util.concurrent.*;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.util.HashMap;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+
+import utils.ConfigLoader;
 
 /**
  * ProxyServer: escucha en un único puerto (60000),
@@ -14,7 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * y mantiene un heartbeat periódico para detectar réplicas caídas/recuperadas.
  */
 public class ProxyServer {
-    public static final int PROXY_PORT = 60000;
+    public static final int PROXY_PORT = ConfigLoader.port;
     private final ServerSocket listenSocket;
     private final List<ServerConnection> backends = new CopyOnWriteArrayList<>();
     private final AtomicInteger rrCounter = new AtomicInteger(0);
